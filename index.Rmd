@@ -1,0 +1,859 @@
+---
+title: "Practical ML Final Project"
+output: 
+     html_document:
+          toc: true
+          toc_depth: 3
+          theme: lumen
+author: Jeffrey Richardson 
+date: April 2018
+---
+
+
+The goal of this project is to use [human activity data](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) to classify the quality of a person's weightlifting exercises into one of six classes - 
+
+* A - Exactly according to the specification
+* B - Throwing elbows to the front
+* C - Lifting the dumbbell only halfway
+* D - Lowering the dumbbell only halfway
+* E - Throwing hips to the front
+
+Class A corresponds to correct execution  
+
+Classes B through E are types of mistakes
+
+This is a supervised learning problem concerning multiclass classification
+
+# Data Preparation
+
+## Read in data
+
+```{r)}
+# Load packages without warning messages,  https://stackoverflow.com/questions/18931006/how-to-suppress-warning-messages-when-loading-a-library
+suppressWarnings(suppressMessages(library(caret)))
+suppressWarnings(suppressMessages(library(dplyr)))
+suppressWarnings(suppressMessages(library(kernlab)))
+suppressWarnings(suppressMessages(library(ggplot2)))
+suppressWarnings(suppressMessages(library(lubridate)))
+suppressWarnings(suppressMessages(library(tidyr)))
+suppressWarnings(suppressMessages(library(corrplot)))
+suppressWarnings(suppressMessages(library(viridis)))
+suppressWarnings(suppressMessages(library(knitr)))
+suppressWarnings(suppressMessages(library(scales)))
+suppressWarnings(suppressMessages(library(stringr)))
+suppressWarnings(suppressMessages(library(ggrepel)))
+suppressWarnings(suppressMessages(library(pander)))
+
+
+# Directory where data is located
+dir <- "/Users/jeffreyrichardson/Documents/Coursera/"
+
+# Training dataset
+pml_trn <- read.table(paste(dir, "pml-training.csv", sep = ""), as.is = TRUE, sep = ",", header = TRUE)
+
+# Several variables, user names, time-stamps, dates, etc.won't be useful for predictions.  
+
+# Remove non-relevant variables, change remaining character class to numerics, re-combine with 'classe'
+suppressWarnings( # Remove warnings notifying that columns will have NA values when converted to numeric
+     trn <- read.table(paste(dir, "pml-training.csv", 
+                             sep = ""), as.is = TRUE, sep = ",", header = TRUE) %>% 
+          select(-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,
+                    cvtd_timestamp,new_window,classe)) %>% 
+          mutate_if(is.character, funs(as.numeric)) %>% 
+          bind_cols(select(pml_trn,classe))
+)
+
+# Read in the testing data
+pml_tst <- read.table(paste(dir, "pml-testing.csv", sep = ""), as.is = TRUE, sep = ",", header = TRUE)
+
+# Remove non-relevant variables, change remaining logical class to numerics, re-combine with 'problem_id'
+tst <- read.table(paste(dir, "pml-testing.csv", sep = ""), 
+                  as.is = TRUE, sep = ",", header = TRUE) %>% 
+     select(-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,
+               cvtd_timestamp,new_window,problem_id)) %>% 
+     mutate_if(is.logical, funs(as.numeric)) %>% 
+     bind_cols(select(pml_tst, problem_id))
+
+# Clear 
+rm(pml_tst,pml_trn)
+```
+## Inspect & Explore data
+
+Create a function to count the number of na values & percentage of na values for each variable.  Check for na's
+
+```{r}
+# 
+naf <- function(x) {
+     library(scales); z <- x
+     tot <- sum(is.na(z)); pct <- percent(tot / length(z))
+     paste(tot, pct, sep = ", ")}
+
+# Check for columns with entirely na values in test set
+sapply(tst[, ], naf)
+```
+
+Before going any further, it will probably be helpful to learn a little about the data itself first
+
+```{r}
+names(trn)
+```
+
+The column names are completely unfamiliar to me.  What in the world is yaw?
+
+This was a good resource from howthingsfly.si.edu, [What are roll, pitch & yaw?](https://howthingsfly.si.edu/flight-dynamics/roll-pitch-and-yaw), where the following has been copied
+
+* Imagine lines x, y, z intersecting at right angles
+     + Rotation around the front-to-back axis is called roll.
+     + Rotation around the side-to-side axis is called pitch.
+     + Rotation around the vertical axis is called yaw.
+
+Definitions of skewness and kurtosis were found here -  https://itl.nist.gov/div898/handbook/eda/section3/eda35b.htm - and copied below  
+
+  
+* "Skewness is a measure of symmetry, or more precisely, the lack of symmetry.  A distribution, or data set, is symmetric if it looks the same to the left and right of the center point."
+
+* "Kurtosis is a measure of whether the data are heavy-tailed or light-tailed relative to a normal distribution.  That is, data sets with high kurtosis tend to have heavy tails, or outliers.  Data sets with low kurtosis tend to have light tails, or lack of outliers. A uniform distribution would be the extreme case."
+
+
+Back to the analysis...
+
+Remove columns with all na values in test set using this [neat little trick](https://stackoverflow.com/questions/15968494/how-to-delete-columns-that-contain-only-nas/15968937)
+
+```{r}
+# https://stackoverflow.com/questions/15968494/how-to-delete-columns-that-contain-only-nas/15968937
+tst <- tst[, colSums(is.na(tst)) != nrow(tst)]; str(tst)
+```
+
+Only leaves 54 columns
+
+Remove columns from training data that don't appear in test set. 
+
+```{r}
+trn <- trn[, names(trn) %in% names(tst) | names(trn) == "classe"]
+
+sapply(trn, naf)
+```
+
+
+Check for covariates with no variability
+
+```{r}
+nsv <- nearZeroVar(trn, saveMetrics = TRUE); nsv; rm(nsv)
+```
+There is sufficient variability in each column, no further variables will be removed.
+
+## Partition data 
+
+60% training set, 20% each for testing & validation sets
+
+
+```{r}
+# Set seed
+set.seed(1357)
+inTrain <- createDataPartition(y = trn$classe,
+                               p = 0.6, 
+                               list = FALSE)
+x <- trn[-inTrain, ]
+training <- trn[inTrain, ]
+
+# Create validation and test sets
+set.seed(1113)
+inTrain <- createDataPartition(y = x$classe,
+                               p = 0.5, 
+                               list = FALSE)
+
+validation <- x[inTrain, ]
+testing <- x[-inTrain,]
+
+# Change 'classe' to a factor
+validation$classe <- factor(validation$classe)
+testing$classe <- factor(testing$classe)
+
+# Clear
+rm(trn,x,inTrain)
+
+dim(training)
+dim(testing)
+dim(validation)
+
+```
+
+# Build Model
+
+## Pre-processing
+
+Use corrplot to check for correlated predictors using the technique taught by Professor Leek in one of the lectures
+```{r, fig.height = 7.5, fig.width = 10.5}
+cor_trn <- cor(training[, -54])
+diag(cor_trn) <- 0
+corrplot(cor_trn, 
+         diag = FALSE,
+         tl.offset = 0.05,
+         type = "upper",
+         method = "square",
+         order = "hclust",
+         tl.cex = 0.6, tl.col = "black")
+
+
+```
+
+
+Notice above that there are several highly (negatively & positively) correlated predictors which suggests that preprocessing the data may be advantageous.
+
+The train() function in the caret package will automatically apply any pre-processing functions to the test set with the predict() command.  (Thanks Max Kuhn!)
+
+All pre-processing for this analysis will therefore be computed within the caret train() function.
+
+## Choose a Model
+
+[This website](https://topepo.github.io/caret/available-models.html) - https://topepo.github.io/caret/available-models.html - was a valuable resource in experimenting with different models.  Support vector machines, naive bayes, multinomial regression, neural networks, and other built-in caret models were explored.
+
+Two methods proved to be much more accurate than the others - Random Forest (method = "rf") as well as Bagged Classification & Regression Trees (method = "treebag").
+
+Each of these methods resulted in predictions with 98% accuracy and above.  
+
+As this author is quite new to machine learning, it seems important to explore the different knobs & levers avaiable inside the caret train() function.  How does varying the pre-processing & training controls affect a model's runtime & accuracy? 
+
+Create several different variations of the 'treebag' and 'rf' models.  Adjust the pre-processing & train control arguments for each different model.  Save each model into an .rds file to avoid having to run again
+
+Create a new data frame to manually document the runtime for each model as they are run
+
+```{r}
+# Bagged classification and regression tree
+# set.seed(3137)
+# modStart <- Sys.time() %>% print
+# bagMod <- train(classe ~ .,
+#                 method = "treebag",
+#                 data = training)
+# 
+# modEnd <- Sys.time()
+# modEnd - modStart # Time difference of 3.53528 mins
+# saveRDS(bagMod, paste(dir, "treeBagModel.rds", sep = ""))
+
+rt <- data.frame(Type = "Default", Method = "treebag", Runtime = 3.53528, stringsAsFactors = FALSE)
+
+# Random Forest
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfMod <- train(classe ~ .,
+#                method = "rf",
+#                data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 41.0043 mins
+# saveRDS(rfMod, paste(dir, "RandomForest_Model.rds", sep = "")) # Saved Sunday the 15th
+
+rt <- bind_rows(rt, data.frame(Type = "Default", Method = "rf", Runtime = 41.0043, stringsAsFactors = FALSE))
+
+
+# Bagged CART with pca
+# set.seed(3137)
+# bag2Start <- Sys.time() %>% print
+# bagModpca <- train(classe ~ .,
+#                 method = "treebag",
+#                 preProcess = "pca",
+#                 data = training)
+# bag2End <- Sys.time()
+# bag2End - bag2Start # Time difference of 2.826962 mins
+# saveRDS(bagModpca, paste(dir, "treeBagModelpca.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "PCA", Method = "treebag", Runtime = 2.826962, stringsAsFactors = FALSE))
+
+# Bagged CART centered, scaled
+# set.seed(3137)
+# bagcsStart <- Sys.time() %>% print
+# bagModcs <- train(classe ~ .,
+#                    method = "treebag",
+#                    preProcess = c("center","scale"),
+#                    data = training)
+# bagcsEnd <- Sys.time()
+# bagcsEnd - bagcsStart # Time difference of 3.485286 mins
+# saveRDS(bagModcs, paste(dir, "treeBagModelcs.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "CS", Method = "treebag", Runtime = 3.485286, stringsAsFactors = FALSE))
+
+# Bagged CART with c("pca","center","scale")
+# set.seed(3137)
+# bag_pcs_Start <- Sys.time() %>% print
+# bag_pcsMod <- train(classe ~ .,
+#                    method = "treebag",
+#                    preProcess = c("pca","center","scale"),
+#                    data = training)
+# bag_pcs_End <- Sys.time()
+# bag_pcs_End - bag_pcs_Start # Time difference of 2.746615 mins
+# saveRDS(bag_pcsMod, paste(dir, "treeBagModelpcacs.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "PCACS", Method = "treebag", Runtime = 2.746615, stringsAsFactors = FALSE))
+
+
+# Random Forest Centered & Scaled
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfMod_cs <- train(classe ~ .,
+#                   method = "rf",
+#                   preProcess = c("center","scale"),
+#                   data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 38.29328 mins
+# saveRDS(rfMod_cs, paste(dir, "rfModel_cs.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "CS", Method = "rf", Runtime = 38.29328, stringsAsFactors = FALSE))
+
+# Random Forest PCA
+# set.seed(6971)
+# rfpcaStart <- Sys.time()
+# rfpcaMod <- train(classe ~ .,
+#                method = "rf",
+#                preProcess = "pca",
+#                data = training)
+# rfpcaEnd <- Sys.time()
+# rfpcaEnd - rfpcaStart # Time difference of 24.48021 mins
+# saveRDS(rfpcaMod, paste(dir, "RandomForest_Model_PCA.rds", sep = "")) # Saved Sunday the 15th
+
+rt <- bind_rows(rt, data.frame(Type = "PCA", Method = "rf", Runtime = 24.48021, stringsAsFactors = FALSE))
+
+# Random Forest with c("pca","center","scale")
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfMod_pcacs <- train(classe ~ .,
+#                   method = "rf",
+#                   preProcess = c("pca","center","scale"),
+#                   data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 38.73667 mins
+# saveRDS(rfMod_pcacs, paste(dir, "rfModel_pcacs.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "PCACS", Method = "rf", Runtime = 38.73667, stringsAsFactors = FALSE))
+
+# Cross validation
+
+# Bagged CART 3 Fold 
+# set.seed(3137)
+# bagStart3 <- Sys.time()
+# bagMod3cv <- train(classe ~ .,
+#                    method = "treebag",
+#                    trControl = trainControl(method = "cv", number = 3),
+#                    data = training)
+# 
+# bagEnd3 <- Sys.time()
+# bagEnd3 - bagStart3 # Time difference of 38.924 secs
+# saveRDS(bagMod3cv, paste(dir, "treeBagModel3cv.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "CV3", Method = "treebag", Runtime = 38.924/60, stringsAsFactors = FALSE))
+
+# Random Forest 3-Fold cross validation
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModcv3 <- train(classe ~ .,
+#                   method = "rf",
+#                   trControl = trainControl(method = "cv", number = 3),
+#                   data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 3.391014 mins
+# saveRDS(rfModcv3, paste(dir, "rfModel_cv3.rds", sep = "")) # 
+
+rt <- bind_rows(rt, data.frame(Type = "CV3", Method = "rf", Runtime = 3.391014, stringsAsFactors = FALSE))
+
+# Bagged CART 5 Fold 
+# set.seed(3137)
+# bagStart5 <- Sys.time()
+# bagMod5cv <- train(classe ~ .,
+#                    method = "treebag",
+#                    trControl = trainControl(method = "cv", number = 5),
+#                    data = training)
+# 
+# bagEnd5 <- Sys.time()
+# bagEnd5 - bagStart5 # Time difference of Time difference of 44.72191 secs
+# saveRDS(bagMod5cv, paste(dir, "treeBagModel5cv.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "CV5", Method = "treebag", Runtime = 44.72191/60, stringsAsFactors = FALSE)) 
+
+# Random Forest 5-Fold cross validation
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModcv5 <- train(classe ~ .,
+#                   method = "rf",
+#                   trControl = trainControl(method = "cv", number = 5),
+#                   data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 6.380342 mins
+# saveRDS(rfModcv5, paste(dir, "rfModel_cv5.rds", sep = "")) # 
+rt <- bind_rows(rt, data.frame(Type = "CV5", Method = "rf", Runtime = 6.380342, stringsAsFactors = FALSE))
+
+
+# Bagged CART 10 Fold CV
+# set.seed(3137)
+# bagStart10 <- Sys.time()
+# bagMod10cv <- train(classe ~ .,
+#                     method = "treebag",
+#                     trControl = trainControl(method = "cv", number = 10),
+#                     data = training)
+# 
+# bagEnd10 <- Sys.time()
+# bagEnd10 - bagStart10 # Time difference of 1.399313 mins
+# saveRDS(bagMod10cv, paste(dir, "treeBagModel10cv.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "CV10", Method = "treebag", Runtime = 1.399313, stringsAsFactors = FALSE))
+
+
+# Random Forest 10-Fold cross validation
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModcv10 <- train(classe ~ .,
+#                    method = "rf",
+#                    trControl = trainControl(method = "cv", number = 10),
+#                    data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 14.0396 mins
+# saveRDS(rfModcv10, paste(dir, "rfModel_cv10.rds", sep = "")) # 
+
+rt <- bind_rows(rt, data.frame(Type = "CV10", Method = "rf", Runtime = 14.0396, stringsAsFactors = FALSE))
+
+# Repeated Cross Validation
+
+# Bagged CART 3 Fold Repeated Cross Validation with 3 repeats
+# set.seed(3137)
+# x <- Sys.time()
+# bagMod_rcv3_3 <- train(classe ~ .,
+#                        method = "treebag",
+#                        trControl = trainControl(method = "repeatedcv", number = 3, repeats = 3),
+#                        data = training)
+# 
+# y <- Sys.time()
+# y - x # Time difference of 1.420233 mins
+# saveRDS(bagMod_rcv3_3, paste(dir, "treeBagModelrcv3_3.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "RCV3_3", Method = "treebag", Runtime = 1.420233, stringsAsFactors = FALSE)) 
+
+# Bagged CART 3 Fold Repeated Cross Validation with 5 repeats
+# set.seed(3137)
+# x <- Sys.time()
+# bagMod_rcv3_5 <- train(classe ~ .,
+#                        method = "treebag",
+#                        trControl = trainControl(method = "repeatedcv", number = 3, repeats = 5),
+#                        data = training)
+# 
+# y <- Sys.time()
+# y - x # Time difference of 1.548092 mins
+# saveRDS(bagMod_rcv3_5, paste(dir, "treeBagModelrcv3_5.rds", sep = ""))
+
+rt <- bind_rows(rt, data.frame(Type = "RCV3_5", Method = "treebag", Runtime = 1.548092, stringsAsFactors = FALSE)) 
+
+
+# Random Forest 3-Fold repeated cross validation with 3 repeats
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModrcv3_3 <- train(classe ~ .,
+#                      method = "rf",
+#                      trControl = trainControl(method = "repeatedcv", number = 3, repeats = 3),
+#                      data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 9.37316 mins
+# saveRDS(rfModrcv3_3, paste(dir, "rfModel_rcv3_3.rds", sep = "")) # 
+rt <- bind_rows(rt, data.frame(Type = "RCV3_3", Method = "rf", Runtime = 9.37316, stringsAsFactors = FALSE))
+
+# Random Forest 3-Fold repeated cross validation with 5 repeats
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModrcv3_5 <- train(classe ~ .,
+#                      method = "rf",
+#                      trControl = trainControl(method = "repeatedcv", number = 3, repeats = 5),
+#                      data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 1.072462 hours
+# saveRDS(rfModrcv3_5, paste(dir, "rfModel_rcv3_5.rds", sep = "")) # 
+
+rt <- bind_rows(rt, data.frame(Type = "RCV3_5", Method = "rf", Runtime = 1.072462*60, stringsAsFactors = FALSE))
+
+# Bagged CART 5 Fold Repeated Cross Validation with 3 repeats
+# set.seed(3137)
+# x <- Sys.time() %>% print
+# bagMod_rcv5_3 <- train(classe ~ .,
+#                        method = "treebag",
+#                        trControl = trainControl(method = "repeatedcv", number = 5, repeats = 3),
+#                        data = training)
+# 
+# y <- Sys.time()
+# y - x # Time difference of 4.788735 mins
+# saveRDS(bagMod_rcv5_3, paste(dir, "treeBagModelrcv5_3.rds", sep = ""))
+rt <- bind_rows(rt, data.frame(Type = "RCV5_3", Method = "treebag", Runtime = 4.788735, stringsAsFactors = FALSE))
+
+# Bagged CART 5 Fold Repeated Cross Validation with 5 repeats
+# set.seed(3137)
+# x <- Sys.time()
+# bagMod_rcv5_5 <- train(classe ~ .,
+#                    method = "treebag",
+#                    trControl = trainControl(method = "repeatedcv", number = 5, repeats = 5),
+#                    data = training)
+# 
+# y <- Sys.time()
+# y - x # Time difference of 3.115155 mins
+# saveRDS(bagMod_rcv5_5, paste(dir, "treeBagModelrcv5_5.rds", sep = ""))
+rt <- bind_rows(rt, data.frame(Type = "RCV5_5", Method = "treebag", Runtime = 3.115155, stringsAsFactors = FALSE))
+
+# Random Forest 5-Fold repeated cross validation with 3 repeats
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModrcv5_3 <- train(classe ~ .,
+#                      method = "rf",
+#                      trControl = trainControl(method = "repeatedcv", number = 5, repeats = 3),
+#                      data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 20.50562 mins
+# saveRDS(rfModrcv5_3, paste(dir, "rfModel_rcv5_3.rds", sep = "")) # 
+
+rt <- bind_rows(rt, data.frame(Type = "RCV5_3", Method = "rf", Runtime = 20.50562, stringsAsFactors = FALSE))
+# Random Forest 5-Fold repeated cross validation with 5 repeats
+# set.seed(8387)
+# xStart <- Sys.time() %>% print
+# rfModrcv5_5 <- train(classe ~ .,
+#                      method = "rf",
+#                      trControl = trainControl(method = "repeatedcv", number = 5, repeats = 5),
+#                      data = training)
+# 
+# xEnd <- Sys.time()
+# xEnd - xStart # Time difference of 1.577143 hours
+# saveRDS(rfModrcv5_5, paste(dir, "rfModel_rcv5_5.rds", sep = "")) # 
+rt <- bind_rows(rt, data.frame(Type = "RCV5_5", Method = "rf", Runtime = 1.577143*60, stringsAsFactors = FALSE))
+
+```
+
+
+Read in the saved models
+```{r}
+# Bagged Classification & Regression Tress (CART) method = 'treebag'
+bagMod <- readRDS(paste(dir, "treeBagModel.rds", sep = ""))
+bagMod_pca <- readRDS(paste(dir, "treeBagModelpca.rds", sep = ""))
+bagMod_cs <- readRDS(paste(dir, "treeBagModelcs.rds", sep = ""))
+bagMod_pcacs <- readRDS(paste(dir, "treeBagModelpcacs.rds", sep = ""))
+bagMod_cv3 <- readRDS(paste(dir, "treeBagModel3cv.rds", sep = ""))
+bagMod_cv5 <- readRDS(paste(dir, "treeBagModel5cv.rds", sep = ""))
+bagMod_cv10 <- readRDS(paste(dir, "treeBagModel10cv.rds", sep = ""))
+bagMod_rcv3_3 <- readRDS(paste(dir, "treeBagModelrcv3_3.rds", sep = ""))
+bagMod_rcv3_5 <- readRDS(paste(dir, "treeBagModelrcv3_5.rds", sep = ""))
+bagMod_rcv5_3 <- readRDS(paste(dir, "treeBagModelrcv5_3.rds", sep = ""))
+bagMod_rcv5_5 <- readRDS(paste(dir, "treeBagModelrcv5_5.rds", sep = ""))
+
+# Random Forest  method = "rf"
+rfMod <- readRDS(paste(dir, "RandomForest_Model.rds", sep = ""))
+rfMod_cs <- readRDS(paste(dir, "rfModel_cs.rds", sep = ""))
+rfMod_pca <- readRDS(paste(dir, "RandomForest_Model_PCA.rds", sep = ""))
+rfMod_pcacs <- readRDS(paste(dir, "rfModel_pcacs.rds", sep = ""))
+rfMod_cv3 <- readRDS(paste(dir, "rfModel_cv3.rds", sep = ""))
+rfMod_cv5 <- readRDS(paste(dir, "rfModel_cv5.rds", sep = ""))
+rfMod_cv10 <- readRDS(paste(dir, "rfModel_cv10.rds", sep = ""))
+rfMod_rcv3_3 <- readRDS(paste(dir, "rfModel_rcv3_3.rds", sep = ""))
+rfMod_rcv3_5 <- readRDS(paste(dir, "rfModel_rcv3_5.rds", sep = ""))
+rfMod_rcv5_3 <- readRDS(paste(dir, "rfModel_rcv5_3.rds", sep = ""))
+rfMod_rcv5_5 <- readRDS(paste(dir, "rfModel_rcv5_5.rds", sep = ""))
+```
+
+# Make Predictions & Evaluate
+
+Predict 'classe' in the testing set
+```{r}
+set.seed(5813)
+bagPredict <- predict(bagMod, testing)
+bagPredict_pca <- predict(bagMod_pca, testing)
+bagPredict_cs <- predict(bagMod_cs, testing)
+bagPredict_pcacs <- predict(bagMod_pcacs, testing)
+bagPredict_cv3 <- predict(bagMod_cv3, testing)
+bagPredict_cv5 <- predict(bagMod_cv5, testing)
+bagPredict_cv10 <- predict(bagMod_cv10, testing)
+bagPredict_rcv3_3 <- predict(bagMod_rcv3_3, testing)
+bagPredict_rcv3_5 <- predict(bagMod_rcv3_5, testing)
+bagPredict_rcv5_3 <- predict(bagMod_rcv5_3, testing)
+bagPredict_rcv5_5 <- predict(bagMod_rcv5_5, testing)
+rfPredict <- predict(rfMod, testing)
+rfPredict_cs <- predict(rfMod_cs, testing)
+rfPredict_pca <- predict(rfMod_pca, testing)
+rfPredict_pcacs <- predict(rfMod_pcacs, testing)
+rfPredict_cv3 <- predict(rfMod_cv3, testing)
+rfPredict_cv5 <- predict(rfMod_cv5, testing)
+rfPredict_cv10 <- predict(rfMod_cv10, testing)
+rfPredict_rcv3_3 <- predict(rfMod_rcv3_3, testing)
+rfPredict_rcv3_5 <- predict(rfMod_rcv3_5, testing)
+rfPredict_rcv5_3 <- predict(rfMod_rcv5_3, testing)
+rfPredict_rcv5_5 <- predict(rfMod_rcv5_5, testing)
+```
+
+
+## Confusion Matrices
+
+Check the accuracy of each model
+
+```{r}
+cm_Bag <- confusionMatrix(bagPredict, testing$classe);  cm_Bag$overall['Accuracy']
+cm_Bag_pca <- confusionMatrix(bagPredict_pca, testing$classe); cm_Bag_pca$overall['Accuracy']
+cm_Bag_cs <- confusionMatrix(bagPredict_cs, testing$classe); cm_Bag_cs$overall['Accuracy'] 
+cm_Bag_pcacs <- confusionMatrix(bagPredict_pcacs, testing$classe); cm_Bag_pcacs$overall['Accuracy'] 
+cm_Bag_cv3 <- confusionMatrix(bagPredict_cv3, testing$classe); cm_Bag_cv3$overall['Accuracy'] 
+cm_Bag_cv5 <- confusionMatrix(bagPredict_cv5, testing$classe); cm_Bag_cv5$overall['Accuracy'] 
+cm_Bag_cv10 <- confusionMatrix(bagPredict_cv10, testing$classe); cm_Bag_cv10$overall['Accuracy'] 
+cm_Bag_rcv3_3 <- confusionMatrix(bagPredict_rcv3_3, testing$classe); cm_Bag_rcv3_3$overall['Accuracy'] 
+cm_Bag_rcv3_5 <- confusionMatrix(bagPredict_rcv3_5, testing$classe); cm_Bag_rcv3_5$overall['Accuracy']    
+cm_Bag_rcv5_3 <- confusionMatrix(bagPredict_rcv5_3, testing$classe); cm_Bag_rcv5_3$overall['Accuracy'] 
+cm_Bag_rcv5_5 <- confusionMatrix(bagPredict_rcv5_5, testing$classe); cm_Bag_rcv5_5$overall['Accuracy'] 
+
+cm_rf <- confusionMatrix(rfPredict, testing$classe); cm_rf$overall['Accuracy'] 
+cm_rf_cs <- confusionMatrix(rfPredict_cs, testing$classe); cm_rf_cs$overall['Accuracy'] 
+cm_rf_pca <- confusionMatrix(rfPredict_pca, testing$classe); cm_rf_pca$overall['Accuracy'] 
+cm_rf_pcacs <- confusionMatrix(rfPredict_pcacs, testing$classe); cm_rf_pcacs$overall['Accuracy']   
+cm_rf_cv3 <- confusionMatrix(rfPredict_cv3, testing$classe); cm_rf_cv3$overall['Accuracy']      
+cm_rf_cv5 <- confusionMatrix(rfPredict_cv5, testing$classe); cm_rf_cv5$overall['Accuracy']      
+cm_rf_cv10 <- confusionMatrix(rfPredict_cv10, testing$classe); cm_rf_cv10$overall['Accuracy']     
+cm_rf_rcv3_3 <- confusionMatrix(rfPredict_rcv3_3, testing$classe); cm_rf_rcv3_3$overall['Accuracy']  
+cm_rf_rcv3_5 <- confusionMatrix(rfPredict_rcv3_5, testing$classe); cm_rf_rcv3_5$overall['Accuracy']     
+cm_rf_rcv5_3 <- confusionMatrix(rfPredict_rcv5_3, testing$classe); cm_rf_rcv5_3$overall['Accuracy'] 
+cm_rf_rcv5_5 <- confusionMatrix(rfPredict_rcv5_5, testing$classe); cm_rf_rcv5_5$overall['Accuracy']       
+```
+
+Add accuacy measurements to the runtime data frame
+
+```{r}
+rt$Accuracy <- NA # Initialize new column
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "Default"] <- cm_Bag$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "PCA"] <- cm_Bag_pca$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "CS"] <- cm_Bag_cs$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "PCACS"] <- cm_Bag_pcacs$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "CV3"] <- cm_Bag_cv3$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "CV5"] <- cm_Bag_cv5$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "CV10"] <- cm_Bag_cv10$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "RCV3_3"] <- cm_Bag_rcv3_3$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "RCV3_5"] <- cm_Bag_rcv3_5$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "RCV5_3"] <- cm_Bag_rcv5_3$overall['Accuracy']
+rt$Accuracy[rt$Method == "treebag" & rt$Type == "RCV5_5"] <- cm_Bag_rcv5_5$overall['Accuracy']
+
+rt$Accuracy[rt$Method == "rf" & rt$Type == "Default"] <- cm_rf$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "PCA"] <- cm_rf_pca$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "CS"] <- cm_rf_cs$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "PCACS"] <- cm_rf_pcacs$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "CV3"] <- cm_rf_cv3$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "CV5"] <- cm_rf_cv5$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "CV10"] <- cm_rf_cv10$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "RCV3_3"] <- cm_rf_rcv3_3$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "RCV3_5"] <- cm_rf_rcv3_5$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "RCV5_3"] <- cm_rf_rcv5_3$overall['Accuracy']
+rt$Accuracy[rt$Method == "rf" & rt$Type == "RCV5_5"] <- cm_rf_rcv5_5$overall['Accuracy']
+
+
+# Format
+rt <- rt %>% 
+     transform(Type = factor(Type, 
+                             levels = c("Default","PCA","CS","PCACS","CV3","CV5",
+                                        "CV10","RCV3_3","RCV3_5","RCV5_3","RCV5_5"),
+                             labels = c("Default","Principle Component Analysis","Center & Scale",
+                                        "PCA, Center & Scale", "3 Fold Cross Validation",
+                                        "5 Fold Cross Validation","10 Fold Cross Validation", 
+                                        "3 Fold Repeated CV 3 Repeats","3 Fold Repeated CV 5 Repeats",
+                                        "5 Fold Repeated CV 3 Repeats","5 Fold Repeated CV 5 Repeats")))
+
+head(rt, 20)
+```
+
+
+Have a look at the runtime data frame
+
+```{r}
+str(rt)
+summary(rt)
+head(rt, 20)
+```
+
+Accuracy ranges from 94% - 99%.  Runtimes vary from less than a minute to over an hour and a half.
+
+
+Plot of Runtime vs accuracy
+
+```{r, fig.height = 7.5, fig.width = 10.5}
+ggplot(rt, aes(Runtime, Accuracy)) +
+     geom_point(size = 3, color = "gray50", alpha = 0.6) +
+     geom_point(size = 2, alpha = 0.6, aes(color = Method)) +
+     geom_label_repel(size = 2, fontface = "bold", min.segment.length = 0.1, show.legend = FALSE,
+                      aes(label = str_wrap(Type, 15), color = Method)) +
+     geom_smooth(se = FALSE, method = loess) +
+     scale_y_continuous(labels = percent) +
+     labs(x = "Runtime (minutes)", y = "Accuracy",
+          title = "Runtime vs Accuracy",
+          subtitle = "Slightly Different Iterations of Random Forest vs Bagged CART Models") +
+     theme_bw() +
+     theme(legend.position = c(0.85,0.15), legend.background = element_rect(color = "gray50")) 
+
+```
+
+Somewhat surprisingly, there is not a strong correlation between runtime and accuracy.
+
+The plot above shows that most of the models achieved accuracy of 98% and above, while the random forest models generally took longer to run.  
+
+Notice also that principle component analysis seemed to diminish the accuracy of the model whenever it was included.  Perhaps there is some subtlety in the correlated predictors which is important for making predictions. 
+
+Repeated cross validation, 'repeatedcv' seemed to generally perform better than non-repeated, 'cv'.  Somewhat surprisingly, increasing the number of repeats or folds did not necessarily improve accuracy.
+
+The next plot below is the same as the one above but faceted by the way each model was trained.  In every case the random forest model took longer to run.  In all cases but one, the random forest model slightly outperformed the bagged CART model.
+
+```{r, fig.height = 7.5, fig.width = 10.5}
+ggplot(rt, aes(Runtime, Accuracy)) +
+     geom_point(size = 4, color = "gray50", alpha = 0.6) +
+     geom_point(size = 3, alpha = 0.6, aes(color = Method)) +
+     scale_y_continuous(labels = percent) +
+     labs(x = "Runtime (minutes)", y = "Accuracy",
+          title = "Runtime vs Accuracy",
+          subtitle = "Iterations of Random Forest vs Bagged CART Models") +
+     theme_bw() +
+     theme(legend.position = c(0.85,0.1), legend.background = element_rect(color = "gray50")) +
+     facet_wrap(~Type)
+```
+
+The next plot shows the accuracy of each model.  It's interesting that the default values 'train(classe ~ ., method = "rf", data = training)' for the random forest model outperformed all but one of the different
+variations.  
+
+
+```{r, fig.height = 7.5, fig.width = 10.5}
+rt %>% 
+     mutate(Lab = paste(Type, Method, sep = ": ")) %>% 
+     ggplot(aes(reorder(Lab, Accuracy), Accuracy)) +
+     geom_point(size = 3, color = "gray50", alpha = 0.6) +
+     geom_point(size = 2, alpha = 0.6, aes(color = Method)) +
+     labs(x = "Runtime (minutes)", y = "Accuracy",
+          title = "Model Accuracy",
+          subtitle = "Iterations of Random Forest vs Bagged CART Models") +
+     scale_y_continuous(labels = percent, limits = c(0.9,1), breaks = seq(0.9,1,0.02)) +
+     coord_flip() +
+     theme_bw() +
+     theme(legend.position = c(0.25,0.75), legend.background = element_rect(color = "gray50"))
+
+```
+
+# Blend best models
+
+Take the top 5 performing models.  Since random forest slightly outperformed bagged CART, choose the top 3 random forest & top 2 bagged CART models with highest accuracy
+
+Build a new dataset using predictions from top 5 models
+```{r}
+blend <- data.frame(rfPredict,bagPredict_cv10,bagPredict_rcv3_3,rfPredict_rcv5_3,
+                    rfPredict_rcv3_3, classe = testing$classe); str(blend)
+
+head(blend, 10)
+```
+
+The following plot is to get a sense of the hits vs misses in each models predictions.  
+
+```{r, fig.height = 7.5, fig.width = 10.5}
+
+blend %>% 
+     rename(Default_Random_Forest = rfPredict,
+            Bagged_CART_3Fold_Rpt_CV_3Rpts = bagPredict_rcv3_3,
+            RF_5Fold_Rpt_CV_3Rpts = rfPredict_rcv5_3,
+            RF_3Fold_Rpt_CV_3Rpts = rfPredict_rcv3_3,
+            Bagged_CART_10Fold_CV = bagPredict_cv10) %>% 
+     gather(Measure, Var, -classe) %>% 
+     transform(Measure = gsub("_", " ", Measure)) %>% 
+     group_by(Measure,Var,classe) %>% 
+     tally() %>% ungroup() %>% arrange(desc(n)) %>% 
+     ggplot(aes(Var,classe)) +
+     geom_tile(color = "gray50", alpha = 0.5, aes(fill = n)) +
+     geom_text(size = 2.5, fontface = "bold", aes(label = comma(n))) +
+     labs(x = "Prediction", y = "Truth",
+          title = "Hits vs Misses for Top 5 Models") +
+     scale_fill_viridis(direction = -1) +
+     facet_wrap(~Measure) +
+     theme_bw() +
+     theme(legend.position = c(0.85,0.15), legend.background = element_rect(color = "gray50"))
+```
+
+Fit a new random forest model that relates the outcome, 'classe', to the different predictions from each model
+
+```{r}
+# set.seed(7511)
+# x1 <- Sys.time()
+# blendMod <- train(classe ~.,
+#              method = "rf",
+#              data = blend)
+# x2 <- Sys.time()
+# x2 - x1 # Time difference of 2.640546 mins
+# saveRDS(blendMod, paste(dir, "blendMod.rds", sep = ""))
+
+blendMod <- readRDS(paste(dir, "blendMod.rds", sep = ""))
+```
+
+
+Create predictions for the holdout validation set
+
+```{r}
+rfPredict <- predict(rfMod, validation)
+bagPredict_cv10 <- predict(bagMod_cv10, validation)
+bagPredict_rcv3_3 <- predict(bagMod_rcv3_3, validation)
+rfPredict_rcv5_3 <- predict(rfMod_rcv3_3, validation)
+rfPredict_rcv3_3 <- predict(rfMod_rcv5_3, validation)
+```
+
+
+Build a data frame with validation set predictions
+```{r}
+pred_df_valid <- data.frame(rfPredict,bagPredict_cv10,bagPredict_rcv3_3,rfPredict_rcv5_3,rfPredict_rcv3_3)
+```
+
+Predict 'classe' using the combined model on the predictions of the validation set
+
+```{r}
+combPredV <- predict(blendMod, pred_df_valid)
+```
+
+Evaluate
+
+```{r}
+cm_blendV <- confusionMatrix(combPredV, validation$classe); cm_blendV$overall['Accuracy']
+
+```
+
+## Out of Sample Error
+
+Confusion matrix for the blended model predictions on the validation set...
+
+```{r}
+
+cm_blendV
+
+```
+__Estimate the out-of-sample error rate__
+
+```{r}
+1 - cm_blendV$overall['Accuracy']
+
+```
+
+The estimated out-of-sample error rate is less than one percent.
+
+With > 99% accuracy, we should expect to correctly classify at least 19 of the 20 test questions
+
+# Create prediction for the 20 test questions
+
+
+Predictions with top 5 models
+```{r}
+rfPredict <- predict(rfMod, tst)
+bagPredict_cv10 <- predict(bagMod_cv10, tst)
+bagPredict_rcv3_3 <- predict(bagMod_rcv3_3, tst)
+rfPredict_rcv5_3 <- predict(rfMod_rcv3_3, tst)
+rfPredict_rcv3_3 <- predict(rfMod_rcv5_3, tst)
+```
+
+Create a data frame with test predictions
+```{r}
+pred_df_tst <- data.frame(rfPredict,bagPredict_cv10,bagPredict_rcv3_3,rfPredict_rcv5_3,rfPredict_rcv3_3)
+```
+
+Fit the blended model to the predictions
+```{r}
+combPred_tst <- predict(blendMod, pred_df_tst);combPred_tst
+```
+
+
